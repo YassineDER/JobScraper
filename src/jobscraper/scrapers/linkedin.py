@@ -20,6 +20,7 @@ from jobscraper.models.job import (
     WorkplaceType,
 )
 from jobscraper.scrapers.base import BaseScraper
+from jobscraper.utils.experience import experience_level_from_description
 
 
 class LinkedInScraper(BaseScraper):
@@ -520,7 +521,7 @@ class LinkedInScraper(BaseScraper):
                 "div.description__text, "
                 "div.jobs-description__content"
             )
-            description_text = description.get_text(strip=True) if description else None
+            description_text = description.get_text(" ", strip=True) if description else None
 
             # Nombre de candidatures ou de clics sur le bouton Postuler
             application_activity_elem = soup.select_one(
@@ -556,8 +557,11 @@ class LinkedInScraper(BaseScraper):
                     experience_level = ExperienceLevel.JUNIOR
                 elif "senior" in text or "confirmé" in text:
                     experience_level = ExperienceLevel.SENIOR
-                elif "mid" in text or "intermédiaire" in text:
-                    experience_level = ExperienceLevel.MID
+
+            # Une exigence chiffrée est plus précise que le niveau déclaré par LinkedIn.
+            inferred_experience = experience_level_from_description(description_text)
+            if inferred_experience is not None:
+                experience_level = inferred_experience
 
             # Compétences
             skills = []

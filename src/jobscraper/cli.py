@@ -173,15 +173,25 @@ def search(
                     jobs.append(job)
                     status.update(f"[bold green]LinkedIn... {len(jobs)} offres trouvées")
 
-            if (details or criteria.exclude_over_100_applicants) and jobs:
+            check_junior = ExperienceLevel.JUNIOR in criteria.experience_levels
+            if (details or criteria.exclude_over_100_applicants or check_junior) and jobs:
                 linkedin_jobs = [j for j in jobs if j.source == "linkedin"]
                 enriched = []
                 excluded_count = 0
+                excluded_experience_count = 0
                 with console.status("[bold cyan]Détails LinkedIn...") as status:
                     for i, job in enumerate(linkedin_jobs, 1):
                         status.update(f"[bold cyan]Détails LinkedIn... {i}/{len(linkedin_jobs)}")
                         job_id = job.id.replace("linkedin_", "")
                         detailed = scraper.get_job_details(job_id)
+                        if (
+                            check_junior
+                            and detailed
+                            and detailed.experience_level is not None
+                            and detailed.experience_level not in criteria.experience_levels
+                        ):
+                            excluded_experience_count += 1
+                            continue
                         if (
                             criteria.exclude_over_100_applicants
                             and detailed
@@ -196,6 +206,11 @@ def search(
                         enriched.append(detailed if detailed else job)
                 # Remplacer les jobs LinkedIn par les enrichis
                 jobs = [j for j in jobs if j.source != "linkedin"] + enriched
+                if excluded_experience_count:
+                    console.print(
+                        f"[yellow]{excluded_experience_count} offre(s) LinkedIn exclue(s) "
+                        "(niveau d'expérience incompatible).[/yellow]"
+                    )
                 if excluded_count:
                     console.print(
                         f"[yellow]{excluded_count} offre(s) LinkedIn exclue(s) "

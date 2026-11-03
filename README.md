@@ -105,6 +105,13 @@ jobscraper search -k react -n 100 --details -o react_jobs.json
 jobscraper search -k python -s linkedin --exclude-over-100-applicants -o jobs.json
 ```
 
+Pour LinkedIn, `-e junior` récupère les détails et écarte les offres dont le
+niveau identifié ne correspond pas. Les offres dont l'expérience reste
+inconnue sont conservées. Quand la description indique une durée d'expérience,
+elle est privilégiée : moins de 3 ans = junior, à partir de 3 ans = senior.
+Pour une fourchette, la borne basse est utilisée. Cette classification est indicative ; les
+formulations non reconnues restent indéterminées.
+
 ### Lister les sources
 
 ```bash
