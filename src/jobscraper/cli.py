@@ -69,6 +69,11 @@ def main(ctx: click.Context, verbose: bool) -> None:
 @click.option("--output", "-o", type=click.Path(), help="Fichier de sortie")
 @click.option("--format", "output_format", type=click.Choice(["json", "csv", "table"]), default="table")
 @click.option("--details", "-d", is_flag=True, help="Récupérer les détails complets")
+@click.option(
+    "--exclude-over-100-applicants",
+    is_flag=True,
+    help="Exclure les offres LinkedIn avec plus de 100 candidatures ou clics sur Postuler",
+)
 @click.option("--source", "-s", multiple=True,
               type=click.Choice(["linkedin", "hellowork", "francetravail", "adzuna", "wttj", "all"]),
               default=["linkedin", "hellowork", "francetravail", "adzuna", "wttj"], help="Sources: linkedin, hellowork, francetravail, adzuna (Indeed+Monster), wttj, all")
@@ -89,6 +94,7 @@ def search(
     output: Optional[str],
     output_format: str,
     details: bool,
+    exclude_over_100_applicants: bool,
     source: tuple,
 ) -> None:
     """
@@ -126,6 +132,7 @@ def search(
         sort_by=SortBy(sort),
         companies=list(company) if company else [],
         max_results=max_results,
+        exclude_over_100_applicants=exclude_over_100_applicants,
     )
 
     # Affichage des critères
@@ -166,17 +173,34 @@ def search(
                     jobs.append(job)
                     status.update(f"[bold green]LinkedIn... {len(jobs)} offres trouvées")
 
-            if details and jobs:
+            if (details or criteria.exclude_over_100_applicants) and jobs:
                 linkedin_jobs = [j for j in jobs if j.source == "linkedin"]
                 enriched = []
+                excluded_count = 0
                 with console.status("[bold cyan]Détails LinkedIn...") as status:
                     for i, job in enumerate(linkedin_jobs, 1):
                         status.update(f"[bold cyan]Détails LinkedIn... {i}/{len(linkedin_jobs)}")
                         job_id = job.id.replace("linkedin_", "")
                         detailed = scraper.get_job_details(job_id)
+                        if (
+                            criteria.exclude_over_100_applicants
+                            and detailed
+                            and scraper.is_over_100_application_activity(
+                                detailed.application_activity
+                            )
+                        ):
+                            excluded_count += 1
+                            continue
+                        if detailed and detailed.posted_at is None:
+                            detailed.posted_at = job.posted_at
                         enriched.append(detailed if detailed else job)
                 # Remplacer les jobs LinkedIn par les enrichis
                 jobs = [j for j in jobs if j.source != "linkedin"] + enriched
+                if excluded_count:
+                    console.print(
+                        f"[yellow]{excluded_count} offre(s) LinkedIn exclue(s) "
+                        "(plus de 100 candidatures ou clics sur Postuler).[/yellow]"
+                    )
 
     # Scraping HelloWork
     if "hellowork" in sources_to_use:
@@ -279,7 +303,8 @@ def save_jobs_csv(jobs: List, output: Optional[str]) -> None:
 
     fieldnames = [
         "id", "source", "title", "company", "location", "url",
-        "contract_type", "experience_level", "remote", "posted_at", "description"
+        "contract_type", "experience_level", "remote", "posted_at", "description",
+        "application_activity",
     ]
 
     if output:

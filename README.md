@@ -78,6 +78,9 @@ Options:
   -o, --output PATH         Fichier de sortie
   --format [json|csv|table] Format de sortie [défaut: table]
   -d, --details             Récupérer les détails complets
+  --exclude-over-100-applicants
+                            Exclure les offres LinkedIn avec plus de 100
+                            candidatures ou clics sur Postuler
 ```
 
 ### Exemples avancés
@@ -97,6 +100,9 @@ jobscraper search -k devops --date past_week --sort date
 
 # 100 résultats avec détails complets
 jobscraper search -k react -n 100 --details -o react_jobs.json
+
+# Exclure les offres LinkedIn avec plus de 100 candidatures ou clics
+jobscraper search -k python -s linkedin --exclude-over-100-applicants -o jobs.json
 ```
 
 ### Lister les sources

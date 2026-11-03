@@ -71,6 +71,10 @@ class JobOffer(BaseModel):
     contract_type: Optional[ContractType] = Field(None, description="Type de contrat")
     experience_level: Optional[ExperienceLevel] = Field(None, description="Niveau d'expérience requis")
     remote: Optional[bool] = Field(None, description="Possibilité de télétravail")
+    application_activity: Optional[str] = Field(
+        None,
+        description="Indication LinkedIn sur le nombre de candidatures ou de clics",
+    )
 
     # Métadonnées
     posted_at: Optional[datetime] = Field(None, description="Date de publication")
@@ -126,6 +130,12 @@ class SearchCriteria(BaseModel):
 
     # Salaire
     salary_min: Optional[int] = Field(None, description="Salaire minimum souhaité")
+
+    # Activité des candidatures (LinkedIn)
+    exclude_over_100_applicants: bool = Field(
+        default=False,
+        description="Exclure les offres avec plus de 100 candidatures ou clics sur Postuler",
+    )
 
     # Tri et pagination
     sort_by: SortBy = Field(default=SortBy.RELEVANCE, description="Tri des résultats")

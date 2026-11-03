@@ -2,6 +2,7 @@
 
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Dict, Iterator, Optional
 from urllib.parse import quote_plus, urlencode
@@ -26,6 +27,11 @@ class LinkedInScraper(BaseScraper):
 
     name = "linkedin"
     base_url = "https://www.linkedin.com"
+
+    APPLICATION_ACTIVITY_SELECTOR = (
+        ".num-applicants__caption, "
+        ".jobs-unified-top-card__applicant-count"
+    )
 
     # Mapping des niveaux d'expérience LinkedIn
     EXPERIENCE_MAPPING = {
@@ -170,6 +176,47 @@ class LinkedInScraper(BaseScraper):
         except Exception as e:
             logger.error(f"Erreur récupération détails job {job_id}: {e}")
             return None
+
+    @staticmethod
+    def is_over_100_application_activity(text: Optional[str]) -> bool:
+        """Indique si le texte signale plus de 100 candidatures ou clics."""
+        if not text:
+            return False
+
+        normalized = unicodedata.normalize("NFKD", text)
+        normalized = "".join(
+            character for character in normalized if not unicodedata.combining(character)
+        )
+        normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+
+        activity_markers = (
+            "applicant",
+            "candidat",
+            "candidature",
+            "people clicked apply",
+            "personnes ont clique sur postuler",
+            "personnes ont clique pour postuler",
+        )
+        if not any(marker in normalized for marker in activity_markers):
+            return False
+
+        match = re.search(r"(\d[\d\s,.]*)\s*\+?", normalized)
+        if not match:
+            return False
+
+        number_text = re.sub(r"\D", "", match.group(1))
+        if not number_text:
+            return False
+
+        count = int(number_text)
+        if count > 100:
+            return True
+
+        threshold_marker = re.search(
+            r"(?:over|more than|plus de)\s+100\b|\b100\s*\+",
+            normalized,
+        )
+        return count == 100 and threshold_marker is not None
 
     def _build_search_url(self, criteria: SearchCriteria) -> str:
         """
@@ -475,6 +522,16 @@ class LinkedInScraper(BaseScraper):
             )
             description_text = description.get_text(strip=True) if description else None
 
+            # Nombre de candidatures ou de clics sur le bouton Postuler
+            application_activity_elem = soup.select_one(
+                self.APPLICATION_ACTIVITY_SELECTOR
+            )
+            application_activity = (
+                application_activity_elem.get_text(" ", strip=True)
+                if application_activity_elem
+                else None
+            )
+
             # Critères (type de contrat, niveau d'expérience, etc.)
             criteria_items = soup.select(
                 "li.description__job-criteria-item, "
@@ -519,6 +576,7 @@ class LinkedInScraper(BaseScraper):
                 contract_type=contract_type,
                 experience_level=experience_level,
                 skills=skills,
+                application_activity=application_activity,
             )
 
         except Exception as e:
