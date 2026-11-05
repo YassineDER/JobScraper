@@ -288,14 +288,6 @@ class WTTJScraper(BaseScraper):
             contract_wttj = hit.get("contract_type", "")
             contract_type = self.CONTRACT_MAPPING.get(contract_wttj)
 
-            # Remote
-            remote_value = hit.get("remote", "")
-            remote = remote_value in ("fulltime", "partial")
-
-            # Salaire
-            salary_min = hit.get("salary_minimum") or hit.get("salary_yearly_minimum")
-            salary_max = hit.get("salary_maximum")
-
             # Date de publication
             posted_at = None
             published = hit.get("published_at")
@@ -328,9 +320,6 @@ class WTTJScraper(BaseScraper):
                 description=description,
                 contract_type=contract_type,
                 experience_level=experience_level,
-                remote=remote,
-                salary_min=salary_min,
-                salary_max=salary_max,
                 posted_at=posted_at,
             )
 

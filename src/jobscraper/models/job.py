@@ -64,13 +64,9 @@ class JobOffer(BaseModel):
 
     # Détails optionnels
     description: Optional[str] = Field(None, description="Description complète du poste")
-    salary_min: Optional[float] = Field(None, description="Salaire minimum")
-    salary_max: Optional[float] = Field(None, description="Salaire maximum")
-    salary_currency: str = Field(default="EUR", description="Devise du salaire")
 
     contract_type: Optional[ContractType] = Field(None, description="Type de contrat")
     experience_level: Optional[ExperienceLevel] = Field(None, description="Niveau d'expérience requis")
-    remote: Optional[bool] = Field(None, description="Possibilité de télétravail")
     application_activity: Optional[str] = Field(
         None,
         description="Indication LinkedIn sur le nombre de candidatures ou de clics",
@@ -79,10 +75,6 @@ class JobOffer(BaseModel):
     # Métadonnées
     posted_at: Optional[datetime] = Field(None, description="Date de publication")
     scraped_at: datetime = Field(default_factory=datetime.now, description="Date de scraping")
-
-    # Informations supplémentaires
-    skills: List[str] = Field(default_factory=list, description="Compétences requises")
-    benefits: List[str] = Field(default_factory=list, description="Avantages proposés")
 
     class Config:
         """Configuration du modèle."""
@@ -95,12 +87,8 @@ class JobOffer(BaseModel):
                 "company": "TechCorp",
                 "location": "Paris, France",
                 "description": "Nous recherchons un développeur Python...",
-                "salary_min": 50000,
-                "salary_max": 70000,
                 "contract_type": "cdi",
                 "experience_level": "senior",
-                "remote": True,
-                "skills": ["Python", "Django", "PostgreSQL"],
             }
         }
 

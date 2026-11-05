@@ -318,7 +318,7 @@ def save_jobs_csv(jobs: List, output: Optional[str]) -> None:
 
     fieldnames = [
         "id", "source", "title", "company", "location", "url",
-        "contract_type", "experience_level", "remote", "posted_at", "description",
+        "contract_type", "experience_level", "posted_at", "description",
         "application_activity",
     ]
 

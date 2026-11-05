@@ -445,16 +445,6 @@ class HelloWorkScraper(BaseScraper):
                 elif "alternance" in contract_text:
                     contract_type = ContractType.ALTERNANCE
 
-            # Salaire
-            salary_min = None
-            salary_max = None
-            salary_elem = soup.select_one("[itemprop='baseSalary'], [class*='salary']")
-            if salary_elem:
-                salary_text = salary_elem.get_text()
-                salary_match = re.search(r"(\d[\d\s]*)\s*(?:€|EUR)", salary_text)
-                if salary_match:
-                    salary_min = float(salary_match.group(1).replace(" ", ""))
-
             return JobOffer(
                 id=f"hellowork_{job_id}",
                 source=self.name,
@@ -464,8 +454,6 @@ class HelloWorkScraper(BaseScraper):
                 location=location,
                 description=description,
                 contract_type=contract_type,
-                salary_min=salary_min,
-                salary_max=salary_max,
             )
 
         except Exception as e:

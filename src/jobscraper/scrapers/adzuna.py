@@ -237,10 +237,6 @@ class AdzunaScraper(BaseScraper):
             # Description
             description = result.get("description", "")
 
-            # Salaire
-            salary_min = result.get("salary_min")
-            salary_max = result.get("salary_max")
-
             # Date de publication
             created = result.get("created")
             posted_at = None
@@ -270,8 +266,6 @@ class AdzunaScraper(BaseScraper):
                 company=company,
                 location=location or "France",
                 description=description,
-                salary_min=salary_min,
-                salary_max=salary_max,
                 contract_type=contract_type,
                 posted_at=posted_at,
             )

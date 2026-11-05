@@ -563,12 +563,6 @@ class LinkedInScraper(BaseScraper):
             if inferred_experience is not None:
                 experience_level = inferred_experience
 
-            # Compétences
-            skills = []
-            skills_section = soup.select("span.job-details-skill-match-status-list__skill-name")
-            for skill in skills_section:
-                skills.append(skill.get_text(strip=True))
-
             return JobOffer(
                 id=f"linkedin_{job_id}",
                 source=self.name,
@@ -579,7 +573,6 @@ class LinkedInScraper(BaseScraper):
                 description=description_text,
                 contract_type=contract_type,
                 experience_level=experience_level,
-                skills=skills,
                 application_activity=application_activity,
             )
 
