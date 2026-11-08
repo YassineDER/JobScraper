@@ -308,7 +308,9 @@ def save_jobs_json(jobs: List, output: Optional[str]) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2, default=str)
         console.print(f"[green]Offres sauvegardées dans {output}[/green]")
     else:
-        console.print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+        # Rich peut insérer des retours à la ligne dans les chaînes JSON
+        # (notamment les URLs longues). L'export doit rester du texte brut.
+        click.echo(json.dumps(data, ensure_ascii=False, indent=2, default=str))
 
 
 def save_jobs_csv(jobs: List, output: Optional[str]) -> None:

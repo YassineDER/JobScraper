@@ -112,6 +112,23 @@ elle est privilégiée : moins de 3 ans = junior, à partir de 3 ans = senior.
 Pour une fourchette, la borne basse est utilisée. Cette classification est indicative ; les
 formulations non reconnues restent indéterminées.
 
+Pour WTTJ, chaque résultat Algolia est enrichi automatiquement avec la description,
+le profil candidat et le processus de recrutement via l'endpoint public de détail.
+Le filtre d'expérience est appliqué ensuite, en privilégiant le profil candidat
+pour ne pas confondre les années d'expérience avec l'ancienneté de l'entreprise.
+Les détails inaccessibles et les offres retirées ne sont pas renvoyés ; avec un
+filtre d'expérience, un niveau restant inconnu est également exclu. Les échecs de
+récupération sont signalés, sans repli silencieux sur le résumé Algolia.
+`--max-results` compte les offres retenues, pas les offres examinées. La pagination
+continue jusqu'à cette limite ou à la fin des résultats accessibles dans Algolia.
+Chaque offre retenue conserve son lien WTTJ dans le champ `url` des exports
+JSON/CSV. `--details` n'est pas nécessaire pour WTTJ.
+
+La localisation WTTJ par défaut est la France. Les filtres salaire et lieu de
+travail ne sont pas appliqués à cette source. Les appels de liste et de détail
+respectent `WTTJ_DELAY` (1 seconde par défaut) et les erreurs transitoires sont
+réessayées. La recherche est donc plus lente qu'une simple lecture de liste.
+
 ### Lister les sources
 
 ```bash

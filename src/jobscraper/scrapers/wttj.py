@@ -1,10 +1,16 @@
 """Scraper pour Welcome to the Jungle (WTTJ)."""
 
+import re
 from datetime import datetime, timedelta, timezone
+from time import monotonic, sleep
 from typing import Dict, Iterator, Optional, Tuple
+from urllib.parse import quote, urlsplit
 
 import requests
+from bs4 import BeautifulSoup
 from loguru import logger
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from jobscraper.models.job import (
     ContractType,
@@ -15,6 +21,7 @@ from jobscraper.models.job import (
     SortBy,
 )
 from jobscraper.scrapers.base import BaseScraper
+from jobscraper.utils.experience import experience_level_from_description
 from jobscraper.utils.geocoding import geocode
 
 
@@ -34,6 +41,7 @@ class WTTJScraper(BaseScraper):
     ALGOLIA_API_KEY = "4bd8f6215d0cc52b26430765769e65a0"
     ALGOLIA_INDEX = "wttj_jobs_production_fr"
     ALGOLIA_DATE_INDEX = "wttj_jobs_production_fr_published_at_desc"
+    DETAILS_BASE_URL = "https://api.welcometothejungle.com/api/v1/organizations"
 
     # Mapping des types de contrat WTTJ
     CONTRACT_MAPPING = {
@@ -70,6 +78,20 @@ class WTTJScraper(BaseScraper):
         """
         super().__init__(config)
         self.hits_per_page = 20
+        self._known_jobs: Dict[str, JobOffer] = {}
+        self._details_cache: Dict[str, Optional[JobOffer]] = {}
+        self._last_request_at: Optional[float] = None
+        self.detail_failures = 0
+        self.unavailable_jobs = 0
+        self._session = requests.Session()
+        retries = Retry(
+            total=max(0, self.config.get("max_retries", 3) - 1),
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "POST"),
+            respect_retry_after_header=True,
+        )
+        self._session.mount("https://", HTTPAdapter(max_retries=retries))
 
     def search(self, criteria: SearchCriteria) -> Iterator[JobOffer]:
         """
@@ -85,6 +107,11 @@ class WTTJScraper(BaseScraper):
         max_results = criteria.max_results
         page = 0
         seen_ids: set = set()
+        unknown_experience_count = 0
+        self._known_jobs.clear()
+        self._details_cache.clear()
+        self.detail_failures = 0
+        self.unavailable_jobs = 0
 
         # Géocodage pour recherche avec rayon
         coords: Optional[Tuple[float, float]] = None
@@ -98,6 +125,7 @@ class WTTJScraper(BaseScraper):
 
         query = self._build_query(criteria, use_geo=use_geo)
         filters = self._build_filters(criteria)
+        cutoff = self._date_cutoff(criteria)
         index_name = (
             self.ALGOLIA_DATE_INDEX
             if criteria.sort_by == SortBy.DATE
@@ -131,32 +159,216 @@ class WTTJScraper(BaseScraper):
                     if jobs_found >= max_results:
                         break
 
-                    job = self._parse_hit(hit)
-                    if job and self._matches_criteria(job, criteria):
-                        if job.id in seen_ids:
-                            continue
-                        seen_ids.add(job.id)
+                    job = self._parse_hit(
+                        hit,
+                        prefer_france=criteria.location.strip().casefold() == "france",
+                    )
+                    if job is None or job.id in seen_ids:
+                        continue
+                    # Dédupliquer avant tout appel de détail, même si l'offre
+                    # est ensuite rejetée ou indisponible.
+                    seen_ids.add(job.id)
+                    self._known_jobs[job.id] = job
+                    self._known_jobs[str(job.url)] = job
+                    detailed = self.get_job_details(job.id)
+                    if detailed and criteria.experience_levels and detailed.experience_level is None:
+                        unknown_experience_count += 1
+                    if detailed and self._matches_criteria(detailed, criteria, cutoff):
                         jobs_found += 1
-                        yield job
+                        yield detailed
+
+                if jobs_found >= max_results:
+                    break
 
                 # Vérifier s'il y a plus de pages
                 total_pages = results.get("nbPages", 1)
                 if page >= total_pages - 1:
+                    if results.get("nbHits", 0) > total_pages * self.hits_per_page:
+                        logger.warning(
+                            "WTTJ limite la pagination à {} offres sur {} correspondances",
+                            total_pages * self.hits_per_page,
+                            results["nbHits"],
+                        )
                     break
 
                 page += 1
 
-            except Exception as e:
+            except (requests.RequestException, ValueError) as e:
                 logger.error(f"Erreur recherche WTTJ: {e}")
                 break
 
         logger.info(f"Recherche terminée: {jobs_found} offres uniques trouvées")
+        if unknown_experience_count:
+            logger.info(
+                "WTTJ: {} offre(s) exclue(s), expérience non identifiable dans les détails",
+                unknown_experience_count,
+            )
+        if self.detail_failures:
+            logger.warning(
+                "WTTJ: {} offre(s) non vérifiée(s), exclue(s) car les détails "
+                "n'ont pas pu être récupérés. Les résultats peuvent être incomplets.",
+                self.detail_failures,
+            )
 
     def get_job_details(self, job_id: str) -> Optional[JobOffer]:
+        """Charge les détails publics depuis une URL WTTJ ou un ID déjà rencontré.
+
+        L'API publique du site expose le contenu intégral de la page, contrairement
+        à Algolia. Aucune offre de liste n'est renvoyée en repli en cas d'échec.
         """
-        WTTJ retourne déjà tous les détails via Algolia.
-        """
-        return None
+        listing = self._known_jobs.get(job_id)
+        url = str(listing.url) if listing else job_id
+        parts = urlsplit(url)
+        match = re.fullmatch(r"/[^/]+/companies/([^/]+)/jobs/([^/]+)/?", parts.path)
+        if (
+            parts.scheme != "https"
+            or parts.netloc not in ("www.welcometothejungle.com", "welcometothejungle.com")
+            or match is None
+        ):
+            logger.warning("URL WTTJ invalide ou ID inconnu: {}", job_id)
+            return None
+
+        organization_slug, job_slug = match.groups()
+        cache_key = f"{organization_slug}/{job_slug}"
+        if cache_key in self._details_cache:
+            cached = self._details_cache[cache_key]
+            return cached.model_copy(deep=True) if cached else None
+
+        endpoint = (
+            f"{self.DETAILS_BASE_URL}/{quote(organization_slug, safe='')}"
+            f"/jobs/{quote(job_slug, safe='')}"
+        )
+        detailed = None
+        try:
+            self._throttle()
+            response = self._session.get(
+                endpoint,
+                headers={"Accept": "application/json"},
+                timeout=self.config.get("timeout", 30),
+            )
+            if response.status_code in (404, 410):
+                self.unavailable_jobs += 1
+                logger.info("Offre WTTJ retirée: {}", url)
+            else:
+                response.raise_for_status()
+                payload = response.json()
+                data = payload.get("job") if isinstance(payload, dict) else None
+                if not isinstance(data, dict):
+                    raise ValueError("Réponse sans objet job")
+                if data.get("archived_at") or data.get("status") not in (None, "published"):
+                    self.unavailable_jobs += 1
+                    logger.info("Offre WTTJ non publiée: {}", url)
+                else:
+                    detailed = self._parse_job_details(data, organization_slug, job_slug, listing)
+        except (requests.RequestException, ValueError) as exc:
+            self.detail_failures += 1
+            logger.warning("Détails WTTJ non vérifiés pour {}: {}", url, exc)
+
+        self._details_cache[cache_key] = detailed
+        return detailed.model_copy(deep=True) if detailed else None
+
+    def _throttle(self) -> None:
+        """Espace tous les appels réseau, pas seulement les pages Algolia."""
+        delay = max(0.0, float(self.config.get("delay", 1.0)))
+        if self._last_request_at is not None:
+            remaining = delay - (monotonic() - self._last_request_at)
+            if remaining > 0:
+                sleep(remaining)
+        self._last_request_at = monotonic()
+
+    @staticmethod
+    def _html_text(html: Optional[str]) -> str:
+        """Conserve les espaces des éléments inline et les limites des paragraphes."""
+        if html is not None and not isinstance(html, str):
+            raise ValueError("Contenu HTML de détail invalide")
+        soup = BeautifulSoup(html or "", "lxml")
+        for element in soup.select("script, style"):
+            element.decompose()
+        for element in soup.select("p, div, li, h1, h2, h3, h4, h5, h6, br"):
+            element.insert_before("\n")
+            element.insert_after("\n")
+        lines = soup.get_text(" ", strip=False).splitlines()
+        return "\n".join(" ".join(line.split()) for line in lines if line.strip())
+
+    @staticmethod
+    def _candidate_requirements(description: str, profile: str) -> str:
+        """Préfère le profil candidat pour ne pas compter l'âge de l'entreprise."""
+        if profile:
+            return profile
+        sections = re.split(
+            r"(?im)^\s*(?:votre profil|profil recherché|qualifications|"
+            r"your profile|requirements|what you bring|who you are)\s*:?\s*$",
+            description,
+        )
+        requirements = sections[-1] if len(sections) > 1 else description
+        return re.split(
+            r"(?im)^\s*(?:processus de recrutement|recruitment process|"
+            r"nos avantages|pourquoi nous rejoindre|about us|benefits)\s*:?\s*$",
+            requirements,
+        )[0]
+
+    def _parse_job_details(
+        self,
+        data: dict,
+        organization_slug: str,
+        job_slug: str,
+        listing: Optional[JobOffer] = None,
+    ) -> JobOffer:
+        """Fusionne les métadonnées de liste et les champs intégraux de l'offre."""
+        description = self._html_text(data.get("description"))
+        profile = self._html_text(data.get("profile"))
+        process = self._html_text(data.get("recruitment_process"))
+        if not description and not profile:
+            raise ValueError("Description et profil absents des détails")
+
+        organization_data = data.get("organization") or {}
+        if not isinstance(organization_data, dict):
+            raise ValueError("Organisation de détail invalide")
+        organization = dict(organization_data)
+        organization["slug"] = organization_slug
+        if listing and not organization.get("name"):
+            organization["name"] = listing.company
+        hit = dict(data)
+        hit.update(
+            reference=(
+                listing.id.removeprefix("wttj_") if listing
+                else data.get("wttj_reference") or data.get("reference")
+            ),
+            name=data.get("name") or (listing.title if listing else None),
+            slug=data.get("slug") or job_slug,
+            organization=organization,
+            offices=data.get("offices") or ([data["office"]] if data.get("office") else []),
+            # Le résumé ne doit pas remplacer la description intégrale.
+            summary="",
+        )
+        level = data.get("experience_level")
+        if isinstance(level, str):
+            minimum = re.match(r"(?:MORE_THAN_)?(\d+)", level)
+            if minimum:
+                hit["experience_level_minimum"] = int(minimum.group(1))
+        job = self._parse_hit(hit, prefer_france=True)
+        if job is None:
+            raise ValueError("Métadonnées de détail invalides")
+        if listing:
+            if job.experience_level is None:
+                job.experience_level = listing.experience_level
+            if not data.get("published_at"):
+                job.posted_at = listing.posted_at
+            if not hit["offices"]:
+                job.location = listing.location
+            if not data.get("contract_type"):
+                job.contract_type = listing.contract_type
+        job.description = "\n\n".join(text for text in (description, profile, process) if text)
+        inferred = experience_level_from_description(
+            self._candidate_requirements(description, profile)
+        )
+        if inferred is not None:
+            job.experience_level = inferred
+        if data.get("contract_type") == "temporary":
+            contract_text = f"{job.title} {description} {profile}".casefold()
+            if re.search(r"\bint[ée]rim(?:aire)?\b", contract_text):
+                job.contract_type = ContractType.INTERIM
+        return job
 
     def _fetch_algolia(
         self,
@@ -205,7 +417,10 @@ class WTTJScraper(BaseScraper):
             payload["aroundLatLng"] = f"{coords[0]},{coords[1]}"
             payload["aroundRadius"] = radius_m
 
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        self._throttle()
+        response = self._session.post(
+            url, headers=headers, json=payload, timeout=self.config.get("timeout", 30)
+        )
         response.raise_for_status()
         return response.json()
 
@@ -254,12 +469,11 @@ class WTTJScraper(BaseScraper):
             if contract_filters:
                 filters.append(f"({' OR '.join(dict.fromkeys(contract_filters))})")
 
-        # Niveau d'expérience. Algolia n'autorise pas les groupes `(A AND B) OR C`,
-        # donc les sélections multiples sont filtrées localement pendant la pagination.
-        if len(criteria.experience_levels) == 1:
-            experience_filter = self._experience_filter(criteria.experience_levels[0])
-            if experience_filter:
-                filters.append(experience_filter)
+        # Le niveau indiqué par WTTJ peut contredire l'exigence chiffrée dans
+        # les détails. Filtrer sur ce champ ici supprimerait les vrais matchs.
+
+        if criteria.location.strip().casefold() == "france":
+            filters.append("offices.country_code:FR")
 
         cutoff = self._date_cutoff(criteria)
         if cutoff:
@@ -277,9 +491,6 @@ class WTTJScraper(BaseScraper):
                 f"NOT organization.name:{self._quote_filter_value(company)}"
             )
 
-        if criteria.salary_min is not None:
-            filters.append(f"salary_yearly_minimum>={int(criteria.salary_min)}")
-
         return " AND ".join(filters) if filters else ""
 
     @staticmethod
@@ -287,25 +498,6 @@ class WTTJScraper(BaseScraper):
         """Protège une valeur textuelle utilisée dans un filtre Algolia."""
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
-
-    @staticmethod
-    def _experience_filter(level: ExperienceLevel) -> Optional[str]:
-        """Construit le filtre Algolia correspondant à un niveau d'expérience."""
-        filters = {
-            ExperienceLevel.INTERNSHIP: "contract_type:internship",
-            ExperienceLevel.JUNIOR: "experience_level_minimum<=1",
-            ExperienceLevel.MID: (
-                "experience_level_minimum>1 AND experience_level_minimum<=3"
-            ),
-            ExperienceLevel.SENIOR: (
-                "experience_level_minimum>3 AND experience_level_minimum<=6"
-            ),
-            ExperienceLevel.LEAD: (
-                "experience_level_minimum>6 AND experience_level_minimum<=10"
-            ),
-            ExperienceLevel.DIRECTOR: "experience_level_minimum>10",
-        }
-        return filters.get(level)
 
     @staticmethod
     def _date_cutoff(criteria: SearchCriteria) -> Optional[datetime]:
@@ -324,9 +516,20 @@ class WTTJScraper(BaseScraper):
             return None
         return datetime.now(timezone.utc) - timedelta(days=days)
 
-    def _matches_criteria(self, job: JobOffer, criteria: SearchCriteria) -> bool:
+    def _matches_criteria(
+        self,
+        job: JobOffer,
+        criteria: SearchCriteria,
+        cutoff: Optional[datetime] = None,
+    ) -> bool:
         """Applique les critères qui nécessitent une validation après parsing."""
         if criteria.contract_types and job.contract_type not in criteria.contract_types:
+            return False
+
+        if (
+            criteria.location.strip().casefold() == "france"
+            and job.location.rsplit(",", 1)[-1].strip().casefold() != "france"
+        ):
             return False
 
         if (
@@ -343,7 +546,7 @@ class WTTJScraper(BaseScraper):
         if company in {value.casefold() for value in criteria.exclude_companies}:
             return False
 
-        cutoff = self._date_cutoff(criteria)
+        cutoff = cutoff or self._date_cutoff(criteria)
         if cutoff:
             if job.posted_at is None:
                 return False
@@ -355,7 +558,7 @@ class WTTJScraper(BaseScraper):
 
         return True
 
-    def _parse_hit(self, hit: dict) -> Optional[JobOffer]:
+    def _parse_hit(self, hit: dict, prefer_france: bool = False) -> Optional[JobOffer]:
         """
         Parse un résultat Algolia en JobOffer.
 
@@ -381,9 +584,18 @@ class WTTJScraper(BaseScraper):
             # Localisation
             offices = hit.get("offices", [])
             if offices:
-                office = offices[0]
+                office = next(
+                    (
+                        office for office in offices
+                        if prefer_france and office.get("country_code") == "FR"
+                    ),
+                    offices[0],
+                )
                 city = office.get("city", "")
-                country = office.get("country", "")
+                country_code = office.get("country_code", "")
+                country = office.get("country") or (
+                    "France" if country_code == "FR" else country_code
+                )
                 location = f"{city}, {country}" if city else country
             else:
                 location = "France"
@@ -430,6 +642,16 @@ class WTTJScraper(BaseScraper):
                     experience_level = ExperienceLevel.LEAD
                 else:
                     experience_level = ExperienceLevel.DIRECTOR
+
+            # La description textuelle est plus précise que le niveau déclaré.
+            inferred_experience = experience_level_from_description(description)
+            if inferred_experience == ExperienceLevel.JUNIOR:
+                experience_level = inferred_experience
+            elif inferred_experience == ExperienceLevel.SENIOR and experience_level not in (
+                ExperienceLevel.LEAD,
+                ExperienceLevel.DIRECTOR,
+            ):
+                experience_level = inferred_experience
 
             return JobOffer(
                 id=f"wttj_{job_id}",
