@@ -1,6 +1,7 @@
 """Scraper pour Welcome to the Jungle (WTTJ)."""
 
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from time import monotonic, sleep
 from typing import Dict, Iterator, Optional, Tuple
@@ -23,6 +24,7 @@ from jobscraper.models.job import (
 from jobscraper.scrapers.base import BaseScraper
 from jobscraper.utils.experience import experience_level_from_description
 from jobscraper.utils.geocoding import geocode
+from jobscraper.utils.title_filters import junior_title_is_excluded
 
 
 class WTTJScraper(BaseScraper):
@@ -43,6 +45,23 @@ class WTTJScraper(BaseScraper):
     ALGOLIA_DATE_INDEX = "wttj_jobs_production_fr_published_at_desc"
     DETAILS_BASE_URL = "https://api.welcometothejungle.com/api/v1/organizations"
 
+    NON_IT_DEVELOPER_TITLE_TERMS = {
+        "business",
+        "commercial",
+        "economique",
+        "ennoblissement",
+        "eolien",
+        "foncier",
+        "franchise",
+        "immobilier",
+        "matiere",
+        "matieres",
+        "photovoltaique",
+        "solaire",
+        "territorial",
+        "textile",
+    }
+
     # Mapping des types de contrat WTTJ
     CONTRACT_MAPPING = {
         "full_time": ContractType.CDI,
@@ -60,8 +79,6 @@ class WTTJScraper(BaseScraper):
     CONTRACT_FILTER_MAPPING = {
         ContractType.CDI: ["full_time"],
         ContractType.CDD: ["temporary", "fixed_term"],
-        # WTTJ regroupe CDD et intérim sous `temporary`. Le résultat est
-        # désambiguïsé localement à partir du titre et du résumé.
         ContractType.INTERIM: ["temporary"],
         ContractType.STAGE: ["internship"],
         ContractType.ALTERNANCE: ["apprenticeship"],
@@ -77,7 +94,7 @@ class WTTJScraper(BaseScraper):
             config: Configuration optionnelle
         """
         super().__init__(config)
-        self.hits_per_page = 20
+        self.hits_per_page = 100
         self._known_jobs: Dict[str, JobOffer] = {}
         self._details_cache: Dict[str, Optional[JobOffer]] = {}
         self._last_request_at: Optional[float] = None
@@ -108,6 +125,7 @@ class WTTJScraper(BaseScraper):
         page = 0
         seen_ids: set = set()
         unknown_experience_count = 0
+        junior_title_exclusions = 0
         self._known_jobs.clear()
         self._details_cache.clear()
         self.detail_failures = 0
@@ -149,6 +167,7 @@ class WTTJScraper(BaseScraper):
                     coords,
                     radius_m,
                     index_name=index_name,
+                    title_only=bool(criteria.title),
                 )
 
                 if not results.get("hits"):
@@ -164,6 +183,20 @@ class WTTJScraper(BaseScraper):
                         prefer_france=criteria.location.strip().casefold() == "france",
                     )
                     if job is None or job.id in seen_ids:
+                        continue
+                    # Algolia normally searches the summary too and applies
+                    # stemming ("developpeur" can match "développer"). In a
+                    # precise title search, reject those false positives before
+                    # the much slower detail request.
+                    if criteria.title and not self._title_matches(
+                        job.title, criteria.title
+                    ):
+                        continue
+                    if (
+                        ExperienceLevel.JUNIOR in criteria.experience_levels
+                        and self._junior_title_is_excluded(job.title)
+                    ):
+                        junior_title_exclusions += 1
                         continue
                     # Dédupliquer avant tout appel de détail, même si l'offre
                     # est ensuite rejetée ou indisponible.
@@ -202,6 +235,12 @@ class WTTJScraper(BaseScraper):
             logger.info(
                 "WTTJ: {} offre(s) exclue(s), expérience non identifiable dans les détails",
                 unknown_experience_count,
+            )
+        if junior_title_exclusions:
+            logger.info(
+                "WTTJ: {} offre(s) exclue(s) avant chargement des détails "
+                "(titre incompatible avec le filtre junior)",
+                junior_title_exclusions,
             )
         if self.detail_failures:
             logger.warning(
@@ -378,6 +417,7 @@ class WTTJScraper(BaseScraper):
         coords: Optional[Tuple[float, float]] = None,
         radius_m: Optional[int] = None,
         index_name: Optional[str] = None,
+        title_only: bool = False,
     ) -> dict:
         """
         Effectue une requête vers l'API Algolia.
@@ -388,6 +428,7 @@ class WTTJScraper(BaseScraper):
             page: Numéro de page
             coords: Coordonnées GPS (lat, lng) pour recherche géographique
             radius_m: Rayon de recherche en mètres
+            title_only: Limite la recherche Algolia au titre de l'offre
 
         Returns:
             Réponse JSON d'Algolia
@@ -408,6 +449,9 @@ class WTTJScraper(BaseScraper):
             "hitsPerPage": self.hits_per_page,
             "page": page,
         }
+
+        if title_only:
+            payload["restrictSearchableAttributes"] = ["name"]
 
         if filters:
             payload["filters"] = filters
@@ -523,6 +567,15 @@ class WTTJScraper(BaseScraper):
         cutoff: Optional[datetime] = None,
     ) -> bool:
         """Applique les critères qui nécessitent une validation après parsing."""
+        if criteria.title and not self._title_matches(job.title, criteria.title):
+            return False
+
+        if (
+            ExperienceLevel.JUNIOR in criteria.experience_levels
+            and self._junior_title_is_excluded(job.title)
+        ):
+            return False
+
         if criteria.contract_types and job.contract_type not in criteria.contract_types:
             return False
 
@@ -557,6 +610,35 @@ class WTTJScraper(BaseScraper):
                 return False
 
         return True
+
+    @staticmethod
+    def _normalized_words(value: str) -> str:
+        """Normalise casse, accents et ponctuation pour comparer des titres."""
+        decomposed = unicodedata.normalize("NFKD", value.casefold())
+        without_accents = "".join(
+            char for char in decomposed if not unicodedata.combining(char)
+        )
+        return " ".join(re.findall(r"[a-z0-9+#.]+", without_accents))
+
+    @classmethod
+    def _title_matches(cls, title: str, expected: str) -> bool:
+        """Vérifie qu'une expression complète apparaît dans le titre."""
+        normalized_title = f" {cls._normalized_words(title)} "
+        normalized_expected = cls._normalized_words(expected)
+        if not normalized_expected or f" {normalized_expected} " not in normalized_title:
+            return False
+
+        if normalized_expected in {"developpeur", "developpeuse", "developer"}:
+            title_words = set(normalized_title.split())
+            if title_words & cls.NON_IT_DEVELOPER_TITLE_TERMS:
+                return False
+
+        return True
+
+    @classmethod
+    def _junior_title_is_excluded(cls, title: str) -> bool:
+        """Détecte les intitulés explicitement refusés pour une recherche junior."""
+        return junior_title_is_excluded(title)
 
     def _parse_hit(self, hit: dict, prefer_france: bool = False) -> Optional[JobOffer]:
         """

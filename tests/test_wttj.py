@@ -114,6 +114,113 @@ def test_search_uses_date_index_and_removes_wrong_temporary_contracts(
     assert calls[0][1]["index_name"] == scraper.ALGOLIA_DATE_INDEX
 
 
+def test_precise_title_rejects_full_text_false_positives_before_details(
+    monkeypatch,
+) -> None:
+    scraper = WTTJScraper()
+    calls = []
+    detail_ids = []
+
+    def fake_fetch(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "hits": [
+                _hit(
+                    "banker",
+                    "Conseiller clientèle",
+                    summary="Développer un portefeuille de clients.",
+                ),
+                _hit("developer", "Développeur Python"),
+            ],
+            "nbPages": 1,
+        }
+
+    def fake_details(identifier):
+        detail_ids.append(identifier)
+        return scraper._known_jobs[identifier]
+
+    monkeypatch.setattr(scraper, "_fetch_algolia", fake_fetch)
+    monkeypatch.setattr(scraper, "get_job_details", fake_details)
+
+    jobs = list(
+        scraper.search(SearchCriteria(title="Developpeur", max_results=10))
+    )
+
+    assert [job.id for job in jobs] == ["wttj_developer"]
+    assert detail_ids == ["wttj_developer"]
+    assert calls[0][1]["title_only"] is True
+
+
+def test_junior_filter_rejects_title_words_before_details(monkeypatch) -> None:
+    scraper = WTTJScraper()
+    detail_ids = []
+
+    def fake_fetch(*args, **kwargs):
+        return {
+            "hits": [
+                _hit("senior", "Développeur Java Senior"),
+                _hit("expert", "Développeuse Python Experte"),
+                _hit("cpp", "Développeur C/C++ embarqué"),
+                _hit("internship", "Stage - Développeur web"),
+                _hit("junior", "Développeur Python junior", experience=1),
+            ],
+            "nbPages": 1,
+        }
+
+    def fake_details(identifier):
+        detail_ids.append(identifier)
+        return scraper._known_jobs[identifier]
+
+    monkeypatch.setattr(scraper, "_fetch_algolia", fake_fetch)
+    monkeypatch.setattr(scraper, "get_job_details", fake_details)
+
+    jobs = list(
+        scraper.search(
+            SearchCriteria(
+                title="Developpeur",
+                experience_levels=[ExperienceLevel.JUNIOR],
+                max_results=10,
+            )
+        )
+    )
+
+    assert [job.id for job in jobs] == ["wttj_junior"]
+    assert detail_ids == ["wttj_junior"]
+
+
+def test_precise_title_matching_is_accent_and_word_aware() -> None:
+    scraper = WTTJScraper()
+
+    assert scraper._title_matches("CDI - Développeur Python", "Developpeur")
+    assert scraper._title_matches("Développeur Java / Angular", "developpeur java")
+    assert not scraper._title_matches("Conseiller chargé de développer le marché", "developpeur")
+    assert not scraper._title_matches("Développeur Java", "develop")
+    assert not scraper._title_matches("Business Developer H/F", "developpeur")
+    assert not scraper._title_matches(
+        "Développeur Ennoblissement Matières - Chaussure", "developpeur"
+    )
+    assert scraper._title_matches("Business Developer H/F", "Business Developer")
+
+
+def test_algolia_title_search_is_restricted_and_uses_large_pages() -> None:
+    scraper = WTTJScraper({"delay": 0})
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"hits": []}
+    scraper._session.post = Mock(return_value=response)
+
+    scraper._fetch_algolia(
+        "Developpeur",
+        "offices.country_code:FR",
+        0,
+        title_only=True,
+    )
+
+    payload = scraper._session.post.call_args.kwargs["json"]
+    assert payload["restrictSearchableAttributes"] == ["name"]
+    assert payload["hitsPerPage"] == 100
+
+
 def test_experience_levels_are_parsed_and_filtered_locally() -> None:
     scraper = WTTJScraper()
     internship = scraper._parse_hit(_hit("stage", "Stage Python", "internship", 0))

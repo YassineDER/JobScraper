@@ -1,10 +1,11 @@
 """Scraper pour HelloWork."""
 
+import json
 import re
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Iterator, Optional
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import urlencode, urlsplit
 
 from bs4 import BeautifulSoup
 from loguru import logger
@@ -18,6 +19,8 @@ from jobscraper.models.job import (
     SortBy,
 )
 from jobscraper.scrapers.base import BaseScraper
+from jobscraper.utils.experience import experience_level_from_description
+from jobscraper.utils.title_filters import junior_title_is_excluded
 
 
 class HelloWorkScraper(BaseScraper):
@@ -53,6 +56,10 @@ class HelloWorkScraper(BaseScraper):
         """
         super().__init__(config)
         self.delay_between_requests = config.get("delay", 2) if config else 2
+        self._last_request_at: Optional[float] = None
+        self._known_jobs: Dict[str, JobOffer] = {}
+        self._details_cache: Dict[str, Optional[JobOffer]] = {}
+        self.detail_failures = 0
 
     def _get_headers(self) -> dict:
         """
@@ -88,12 +95,19 @@ class HelloWorkScraper(BaseScraper):
         jobs_found = 0
         max_results = criteria.max_results
         seen_ids: set = set()
+        filter_junior = ExperienceLevel.JUNIOR in criteria.experience_levels
+        junior_title_exclusions = 0
+        unknown_experience_count = 0
+        self._known_jobs.clear()
+        self._details_cache.clear()
+        self.detail_failures = 0
 
         while jobs_found < max_results:
             page_url = f"{url}&p={page}" if page > 1 else url
             logger.debug(f"Récupération page {page}: {page_url}")
 
             try:
+                self._wait_before_request()
                 html = self._fetch_page(page_url)
                 soup = BeautifulSoup(html, "lxml")
 
@@ -114,22 +128,67 @@ class HelloWorkScraper(BaseScraper):
                             logger.debug(f"Doublon ignoré: {job.id}")
                             continue
                         seen_ids.add(job.id)
-                        jobs_found += 1
+                        # Count unseen candidates, not accepted results: a page
+                        # entirely excluded by the junior filter is not the end.
                         new_jobs_on_page += 1
-                        yield job
+                        if filter_junior and junior_title_is_excluded(job.title):
+                            junior_title_exclusions += 1
+                            continue
+                        self._known_jobs[job.id] = job
+                        self._known_jobs[str(job.url)] = job
+                        detailed = self.get_job_details(job.id)
+                        if detailed is None:
+                            continue
+                        if (
+                            criteria.experience_levels
+                            and detailed.experience_level is None
+                        ):
+                            unknown_experience_count += 1
+                        if (
+                            criteria.experience_levels
+                            and detailed.experience_level not in criteria.experience_levels
+                        ):
+                            continue
+                        if (
+                            criteria.contract_types
+                            and detailed.contract_type not in criteria.contract_types
+                        ):
+                            continue
+                        jobs_found += 1
+                        yield detailed
 
                 if new_jobs_on_page == 0:
                     logger.info("Plus de nouvelles offres")
                     break
 
+                if jobs_found >= max_results:
+                    break
+
                 page += 1
-                time.sleep(self.delay_between_requests)
 
             except Exception as e:
                 logger.error(f"Erreur lors de la recherche: {e}")
                 break
 
         logger.info(f"Recherche terminée: {jobs_found} offres uniques trouvées")
+        if junior_title_exclusions:
+            logger.info(
+                "HelloWork: {} offre(s) exclue(s) "
+                "(titre incompatible avec le filtre junior)",
+                junior_title_exclusions,
+            )
+        if unknown_experience_count:
+            logger.info(
+                "HelloWork: {} offre(s) exclue(s), expérience non identifiable "
+                "dans les détails",
+                unknown_experience_count,
+            )
+        if self.detail_failures:
+            logger.warning(
+                "HelloWork: {} offre(s) exclue(s), détails inaccessibles ou incomplets. "
+                "Les résultats peuvent être incomplets.",
+                self.detail_failures,
+            )
 
     def get_job_details(self, job_id: str) -> Optional[JobOffer]:
         """
@@ -141,18 +200,53 @@ class HelloWorkScraper(BaseScraper):
         Returns:
             JobOffer avec tous les détails ou None
         """
-        # Extraire l'ID numérique si préfixé
-        numeric_id = job_id.replace("hellowork_", "")
-        url = f"{self.base_url}/fr-fr/emplois/{numeric_id}.html"
-        logger.debug(f"Récupération détails: {url}")
+        listing = self._known_jobs.get(job_id)
+        if listing:
+            url = str(listing.url)
+        elif job_id.startswith("https://"):
+            url = job_id
+        else:
+            numeric_id = job_id.removeprefix("hellowork_")
+            url = f"{self.base_url}/fr-fr/emplois/{numeric_id}.html"
 
+        parts = urlsplit(url)
+        match = re.fullmatch(r"/fr-fr/emplois/(\d+)\.html", parts.path)
+        if (
+            parts.scheme != "https"
+            or parts.netloc not in ("www.hellowork.com", "hellowork.com")
+            or match is None
+        ):
+            logger.warning("Identifiant ou URL HelloWork invalide: {}", job_id)
+            return None
+
+        numeric_id = match.group(1)
+        if numeric_id in self._details_cache:
+            cached = self._details_cache[numeric_id]
+            return cached.model_copy(deep=True) if cached else None
+
+        logger.debug("Récupération détails: {}", url)
+        detailed = None
         try:
+            self._wait_before_request()
             html = self._fetch_page(url)
             soup = BeautifulSoup(html, "lxml")
-            return self._parse_job_details(soup, numeric_id, url)
-        except Exception as e:
-            logger.error(f"Erreur récupération détails job {job_id}: {e}")
-            return None
+            detailed = self._parse_job_details(soup, numeric_id, url, listing)
+            if detailed is None:
+                raise ValueError("Fiche JobPosting ou description absente")
+        except Exception as exc:
+            self.detail_failures += 1
+            logger.warning("Détails HelloWork non vérifiés pour {}: {}", url, exc)
+
+        self._details_cache[numeric_id] = detailed
+        return detailed.model_copy(deep=True) if detailed else None
+
+    def _wait_before_request(self) -> None:
+        """Espace les requêtes de liste et de détail vers HelloWork."""
+        if self._last_request_at is not None:
+            remaining = self.delay_between_requests - (time.monotonic() - self._last_request_at)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_request_at = time.monotonic()
 
     def _build_search_url(self, criteria: SearchCriteria) -> str:
         """
@@ -189,7 +283,10 @@ class HelloWorkScraper(BaseScraper):
                 if ct in self.CONTRACT_MAPPING
             ]
             if contract_codes:
-                params["c"] = ",".join(filter(None, contract_codes))
+                # HelloWork expects repeated c parameters for multiple
+                # contracts; a comma-separated value makes the site return
+                # zero offers (e.g. c=CDI%2CCDD).
+                params["c"] = list(filter(None, contract_codes))
 
         # Date de publication
         if criteria.date_posted and criteria.date_posted != DatePosted.ANY_TIME:
@@ -201,7 +298,7 @@ class HelloWorkScraper(BaseScraper):
         if criteria.radius_km:
             params["ray"] = str(criteria.radius_km)
 
-        return f"{base}?{urlencode(params)}" if params else base
+        return f"{base}?{urlencode(params, doseq=True)}" if params else base
 
     def _extract_job_cards(self, soup: BeautifulSoup) -> list:
         """
@@ -393,69 +490,126 @@ class HelloWorkScraper(BaseScraper):
 
         return None
 
-    def _parse_job_details(self, soup: BeautifulSoup, job_id: str, url: str) -> Optional[JobOffer]:
-        """
-        Parse les détails complets d'une offre.
+    @staticmethod
+    def _html_text(value: Optional[str]) -> str:
+        """Convertit une description HTML en texte avec paragraphes lisibles."""
+        if not isinstance(value, str):
+            return ""
+        fragment = BeautifulSoup(value, "lxml")
+        for element in fragment.select("script, style"):
+            element.decompose()
+        for element in fragment.select("p, div, li, h1, h2, h3, h4, br"):
+            element.insert_before("\n")
+            element.insert_after("\n")
+        return "\n".join(
+            " ".join(line.split())
+            for line in fragment.get_text(" ", strip=False).splitlines()
+            if line.strip()
+        )
 
-        Args:
-            soup: BeautifulSoup de la page de détails
-            job_id: ID de l'offre
-            url: URL de l'offre
+    @staticmethod
+    def _profile_requirements(description: str, qualifications: str) -> str:
+        """Isole le profil candidat pour éviter les années d'âge de l'entreprise."""
+        if qualifications:
+            return qualifications
+        sections = re.split(
+            r"(?im)^\s*(?:le profil recherché|profil recherché|votre profil|"
+            r"profil du candidat|qualifications)\s*$",
+            description,
+        )
+        if len(sections) < 2:
+            return description
+        return re.split(
+            r"(?im)^\s*(?:bienvenue chez|à propos de|qui sommes-nous|"
+            r"pourquoi nous rejoindre|les avantages|processus de recrutement)\b.*$",
+            sections[-1],
+        )[0]
 
-        Returns:
-            JobOffer avec détails complets
-        """
-        try:
-            # Titre
-            title_elem = soup.select_one("h1, [class*='job-title']")
-            title = title_elem.get_text(strip=True) if title_elem else "Unknown"
-
-            # Entreprise
-            company_elem = soup.select_one(
-                "[class*='company'], [class*='entreprise'], "
-                "[itemprop='hiringOrganization']"
-            )
-            company = company_elem.get_text(strip=True) if company_elem else "Non spécifié"
-
-            # Localisation
-            location_elem = soup.select_one(
-                "[class*='location'], [class*='lieu'], "
-                "[itemprop='jobLocation']"
-            )
-            location = location_elem.get_text(strip=True) if location_elem else "France"
-
-            # Description
-            description_elem = soup.select_one(
-                "[class*='description'], [itemprop='description'], "
-                ".job-description, #job-description"
-            )
-            description = description_elem.get_text(strip=True) if description_elem else None
-
-            # Type de contrat
-            contract_type = None
-            contract_elem = soup.select_one("[itemprop='employmentType']")
-            if contract_elem:
-                contract_text = contract_elem.get_text().lower()
-                if "cdi" in contract_text:
-                    contract_type = ContractType.CDI
-                elif "cdd" in contract_text:
-                    contract_type = ContractType.CDD
-                elif "stage" in contract_text:
-                    contract_type = ContractType.STAGE
-                elif "alternance" in contract_text:
-                    contract_type = ContractType.ALTERNANCE
-
-            return JobOffer(
-                id=f"hellowork_{job_id}",
-                source=self.name,
-                url=url,
-                title=title,
-                company=company,
-                location=location,
-                description=description,
-                contract_type=contract_type,
-            )
-
-        except Exception as e:
-            logger.error(f"Erreur parsing détails: {e}")
+    def _parse_job_details(
+        self,
+        soup: BeautifulSoup,
+        job_id: str,
+        url: str,
+        listing: Optional[JobOffer] = None,
+    ) -> Optional[JobOffer]:
+        """Lit la fiche structurée JobPosting, avec les métadonnées de liste en repli."""
+        data = None
+        for script in soup.select('script[type="application/ld+json"]'):
+            try:
+                candidate = json.loads(script.string or script.get_text())
+            except (TypeError, ValueError):
+                continue
+            if isinstance(candidate, dict) and candidate.get("@type") == "JobPosting":
+                data = candidate
+                break
+        if data is None:
             return None
+
+        description = self._html_text(data.get("description"))
+        if not description:
+            return None
+        qualifications = self._html_text(data.get("qualifications"))
+        if qualifications and qualifications not in description:
+            full_description = f"{description}\n\n{qualifications}"
+        else:
+            full_description = description
+
+        inferred = experience_level_from_description(
+            self._profile_requirements(description, qualifications)
+        )
+        if inferred is None:
+            requirement = data.get("experienceRequirements")
+            months = requirement.get("monthsOfExperience") if isinstance(requirement, dict) else None
+            if isinstance(months, (int, float, str)) and not isinstance(months, bool):
+                try:
+                    years = float(months) / 12
+                    if years >= 0:
+                        inferred = (
+                            ExperienceLevel.JUNIOR if years < 3
+                            else ExperienceLevel.SENIOR
+                        )
+                except ValueError:
+                    pass
+
+        organization = data.get("hiringOrganization")
+        company = organization.get("name") if isinstance(organization, dict) else None
+        place = data.get("jobLocation")
+        if isinstance(place, list):
+            place = next((item for item in place if isinstance(item, dict)), None)
+        address = place.get("address") if isinstance(place, dict) else None
+        city = address.get("addressLocality") if isinstance(address, dict) else None
+        country = address.get("addressCountry") if isinstance(address, dict) else None
+        location = f"{city}, France" if city and country == "FR" else city
+
+        employment = data.get("employmentType") or []
+        employment = [employment] if isinstance(employment, str) else employment
+        contract_type = listing.contract_type if listing else None
+        if isinstance(employment, list):
+            if "TEMPORARY" in employment:
+                contract_type = ContractType.CDD
+            elif "INTERN" in employment:
+                contract_type = ContractType.STAGE
+            elif "CONTRACTOR" in employment:
+                contract_type = ContractType.FREELANCE
+            elif "FULL_TIME" in employment:
+                contract_type = ContractType.CDI
+
+        posted_at = listing.posted_at if listing else None
+        if isinstance(data.get("datePosted"), str):
+            try:
+                posted_at = datetime.fromisoformat(data["datePosted"].replace("Z", "+00:00"))
+            except ValueError:
+                pass
+
+        return JobOffer(
+            id=f"hellowork_{job_id}",
+            source=self.name,
+            url=url,
+            title=data.get("title") or (listing.title if listing else "Non spécifié"),
+            company=company or (listing.company if listing else "Non spécifié"),
+            location=location or (listing.location if listing else "France"),
+            description=full_description,
+            contract_type=contract_type,
+            experience_level=inferred,
+            posted_at=posted_at,
+        )

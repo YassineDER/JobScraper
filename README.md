@@ -92,6 +92,9 @@ jobscraper search -k "data engineer" -c cdi -e senior -w remote -o jobs.json
 # Recherche sur WTTJ uniquement
 jobscraper search -k python -l Paris -s wttj
 
+# Recherche WTTJ précise dans le titre (évite les correspondances du résumé)
+jobscraper search -t développeur -l Paris -s wttj
+
 # Recherche sur toutes les sources
 jobscraper search -k développeur -l Toulouse -s all
 
@@ -123,6 +126,14 @@ récupération sont signalés, sans repli silencieux sur le résumé Algolia.
 continue jusqu'à cette limite ou à la fin des résultats accessibles dans Algolia.
 Chaque offre retenue conserve son lien WTTJ dans le champ `url` des exports
 JSON/CSV. `--details` n'est pas nécessaire pour WTTJ.
+
+Pour HelloWork aussi, chaque offre de liste est enrichie automatiquement depuis
+sa page individuelle : la description complète et les métadonnées de la fiche
+sont exportées. Le niveau d'expérience est déduit en priorité du profil candidat,
+puis du minimum chiffré indiqué par HelloWork. Avec `-e junior`, les offres dont
+les détails indiquent un autre niveau ou ne permettent pas de le déterminer
+sont exclues. Les fiches indisponibles ne sont pas exportées ; `--details` n'est
+pas nécessaire pour HelloWork non plus. `HELLOWORK_DELAY` espace les requêtes.
 
 La localisation WTTJ par défaut est la France. Les filtres salaire et lieu de
 travail ne sont pas appliqués à cette source. Les appels de liste et de détail
